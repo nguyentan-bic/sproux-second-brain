@@ -1,0 +1,23 @@
+{
+  "name": "sproux-second-brain",
+  "version": "1.0.0",
+  "private": true,
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "db:create": "wrangler d1 create second-brain-db",
+    "db:migrate": "wrangler d1 execute second-brain-db --file=schema.sql",
+    "db:migrate:remote": "wrangler d1 execute second-brain-db --remote --file=schema.sql",
+    "vectors:create": "wrangler vectorize create second-brain-vectors --dimensions=384 --metric=cosine"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.0.0",
+    "agents": "^0.0.1",
+    "zod": "^3.23.0"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^4.20241022.0",
+    "typescript": "^5.5.0",
+    "wrangler": "^3.80.0"
+  }
+}

@@ -1,0 +1,26 @@
+name = "sproux-second-brain"
+main = "src/index.ts"
+compatibility_date = "2024-11-01"
+compatibility_flags = ["nodejs_compat"]
+
+# AUTH_TOKEN must be set as a secret after deployment:
+# wrangler secret put AUTH_TOKEN
+
+[[d1_databases]]
+binding = "DB"
+database_name = "second-brain-db"
+database_id = "69fac930-165d-4dac-8356-30f8a3c82d23"
+
+[[vectorize]]
+binding = "VECTORIZE"
+index_name = "second-brain-vectors"
+dimensions = 384
+metric = "cosine"
+# Created automatically by Deploy to Cloudflare button
+# Or manually: wrangler vectorize create second-brain-vectors --dimensions=384 --metric=cosine
+
+[ai]
+binding = "AI"
+
+[assets]
+directory = "./public"
