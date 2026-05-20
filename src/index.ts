@@ -134,8 +134,8 @@ async function appendToEntry(
   source: string
 ): Promise<void> {
   const timestamp = new Date().toLocaleDateString();
-  const separator = `\n\n[Update ${timestamp}]: `;
-  const newContent = existingContent + separator + addition;
+  const separator = `\n\n[Previous version before ${timestamp}]:\n`;
+const newContent = addition + separator + existingContent;
 
   // Update full content in D1
   await env.DB.prepare(
