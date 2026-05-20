@@ -118,12 +118,41 @@ async function storeEntry(
     }))
   );
 
-  await env.VECTORIZE.insert(vectors);
+  await env.VECTORIZE.upsert(vectors);
+
+  const vectorIds = vectors.map((v) => v.id);
+  await env.DB.prepare(
+    `UPDATE entries SET vector_ids = ? WHERE id = ?`
+  ).bind(JSON.stringify(vectorIds), id).run();
+}
+
+// ─── Fallback: locate vectors for pre-migration entries ──────────────────────
+// Entries written before the vector_ids column existed have vector_ids = '[]'.
+// Query Vectorize by the entry's own content embedding and filter matches whose
+// metadata.parentId points back to this entry id.
+
+async function findVectorIdsByParent(
+  env: Env,
+  id: string,
+  content: string
+): Promise<string[]> {
+  const values = await embed(content.slice(0, 512), env);
+  const results = await env.VECTORIZE.query(values, {
+    topK: 50,
+    returnMetadata: "all",
+  });
+  return results.matches
+    .filter((m) => {
+      const parentId = (m.metadata as any)?.parentId;
+      return parentId === id || m.id === id;
+    })
+    .map((m) => m.id);
 }
 
 // ─── Append to existing entry ─────────────────────────────────────────────────
-// Updates D1 with the full appended content, then adds only the new addition
-// as a new Vectorize chunk pointing to the same parent ID.
+// Embed-first / delete-after: capture old vector IDs, write new content to D1,
+// upsert the new vector set, then delete only the leftover old IDs. If embed
+// fails, the old vectors stay intact instead of leaving the entry vectorless.
 
 async function appendToEntry(
   env: Env,
@@ -137,37 +166,44 @@ async function appendToEntry(
   const separator = `\n\n[Update ${timestamp}]: `;
   const newContent = existingContent + separator + addition;
 
-  // Update full content in D1
+  // Resolve old vector IDs BEFORE storeEntry overwrites vector_ids in D1.
+  // Fall back to a Vectorize parentId scan for pre-migration entries.
+  const oldRow = await env.DB.prepare(
+    `SELECT vector_ids FROM entries WHERE id = ?`
+  ).bind(id).first() as Record<string, any> | null;
+  let oldVectorIds: string[] = JSON.parse(oldRow?.vector_ids ?? "[]");
+  if (!oldVectorIds.length && existingContent) {
+    try {
+      oldVectorIds = await findVectorIdsByParent(env, id, existingContent);
+    } catch (e) {
+      console.error("Vectorize parent scan failed (non-fatal):", e);
+    }
+  }
+
   await env.DB.prepare(
     `UPDATE entries SET content = ? WHERE id = ?`
   ).bind(newContent, id).run();
 
-  // Count existing chunks so we don't collide on IDs
-  // Vectorize doesn't have a list-by-prefix API so we track via D1
-  // We store chunk count in a simple way: try IDs until we find a gap
-  let chunkIndex = 0;
-  // Find next available chunk index by checking if base ID exists
-  // For single-chunk entries the base ID is used directly, so start at 1
-  // For multi-chunk entries, chunks are {id}-chunk-0, {id}-chunk-1, etc.
-  // We add the new addition chunk at the next available index
-  // Safe approach: use timestamp-based suffix to guarantee uniqueness
-  const newChunkId = `${id}-update-${Date.now()}`;
+  // Embed + upsert new vectors first. If this throws, the old vectors are
+  // still intact and recall keeps working — we just have stale content
+  // in D1 vs. vectors, which is far less bad than losing all vectors.
+  await storeEntry(env, id, newContent, tags, source, Date.now());
 
-  const values = await embed(addition, env);
-  await env.VECTORIZE.insert([{
-    id: newChunkId,
-    values,
-    metadata: {
-      content: addition.slice(0, 512),
-      parentId: id,
-      chunkIndex: chunkIndex,
-      totalChunks: 1,
-      isUpdate: true,
-      tags,
-      source,
-      created_at: Date.now(),
-    },
-  }]);
+  // Delete only the old IDs that aren't reused by the new vector set
+  // (storeEntry uses deterministic chunk IDs, so shared IDs were just upserted).
+  const newRow = await env.DB.prepare(
+    `SELECT vector_ids FROM entries WHERE id = ?`
+  ).bind(id).first() as Record<string, any> | null;
+  const newVectorIds: string[] = JSON.parse(newRow?.vector_ids ?? "[]");
+  const newSet = new Set(newVectorIds);
+  const stale = oldVectorIds.filter((vid) => !newSet.has(vid));
+  if (stale.length) {
+    try {
+      await env.VECTORIZE.deleteByIds(stale);
+    } catch (e) {
+      console.error("Stale vector cleanup failed (non-fatal):", e);
+    }
+  }
 }
 
 // ─── MCP Server ───────────────────────────────────────────────────────────────
@@ -357,16 +393,29 @@ function buildMcpServer(env: Env): McpServer {
     "Delete an entry from your second brain by ID",
     { id: z.string().describe("Entry ID from recall or list_recent") },
     async ({ id }) => {
+      const row = await env.DB.prepare(
+        `SELECT content, vector_ids FROM entries WHERE id = ?`
+      ).bind(id).first() as Record<string, any> | null;
+      let vectorIds: string[] = row ? JSON.parse(row.vector_ids ?? "[]") : [];
+
+      // Fallback for pre-migration entries: vector_ids was never populated,
+      // so locate vectors via parentId metadata before we lose the content.
+      if (row && !vectorIds.length && row.content) {
+        try {
+          vectorIds = await findVectorIdsByParent(env, id, row.content as string);
+        } catch (e) {
+          console.error("Vectorize parent scan failed (non-fatal):", e);
+        }
+      }
+
       await env.DB.prepare(`DELETE FROM entries WHERE id = ?`).bind(id).run();
 
-      try {
-        const chunkIds = Array.from({ length: 20 }, (_, i) => `${id}-chunk-${i}`);
-        await env.VECTORIZE.deleteByIds([id, ...chunkIds]);
-        // Also attempt to delete any update chunks
-        const updateIds = Array.from({ length: 50 }, (_, i) => `${id}-update-${i}`);
-        await env.VECTORIZE.deleteByIds(updateIds);
-      } catch (e) {
-        console.error("Vectorize delete failed (non-fatal):", e);
+      if (vectorIds.length) {
+        try {
+          await env.VECTORIZE.deleteByIds(vectorIds);
+        } catch (e) {
+          console.error("Vectorize delete failed (non-fatal):", e);
+        }
       }
 
       return { content: [{ type: "text", text: `Deleted entry ${id}` }] };
@@ -418,10 +467,11 @@ export default {
         `INSERT INTO entries (id, content, tags, source, created_at) VALUES (?, ?, ?, ?, ?)`
       ).bind(id, c, JSON.stringify(finalTags), s, now).run();
 
-      ctx.waitUntil(
-        storeEntry(env, id, c, finalTags, s, now)
-          .catch((e) => console.error("Async embed failed:", e))
-      );
+      try {
+        await storeEntry(env, id, c, finalTags, s, now);
+      } catch (e) {
+        console.error("Vectorize insert failed (non-fatal):", e);
+      }
 
       if (dup.status === "flagged") {
         return json({
