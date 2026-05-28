@@ -499,6 +499,23 @@ export default {
 
     // /mcp
     if (url.pathname === "/mcp") {
+      // Stateless transport (sessionIdGenerator: undefined) cannot serve the
+      // standalone GET SSE stream — it opens an empty stream that never closes,
+      // so the Workers runtime cancels the request as "hung" and the MCP client
+      // retries forever, spamming error logs. Tool calls use POST, so reject any
+      // non-POST method up front. 405 tells the client SSE isn't supported and it
+      // stops retrying.
+      if (request.method !== "POST") {
+        return json(
+          {
+            jsonrpc: "2.0",
+            error: { code: -32000, message: "Method Not Allowed: stateless server only accepts POST" },
+            id: null,
+          },
+          405
+        );
+      }
+
       const transport = new WebStandardStreamableHTTPServerTransport({
         sessionIdGenerator: undefined,
       });
