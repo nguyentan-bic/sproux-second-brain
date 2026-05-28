@@ -499,17 +499,30 @@ export default {
 
     // /mcp
     if (url.pathname === "/mcp") {
-      // Stateless transport (sessionIdGenerator: undefined) cannot serve the
-      // standalone GET SSE stream — it opens an empty stream that never closes,
-      // so the Workers runtime cancels the request as "hung" and the MCP client
-      // retries forever, spamming error logs. Tool calls use POST, so reject any
-      // non-POST method up front. 405 tells the client SSE isn't supported and it
-      // stops retrying.
+      // The MCP client opens a standalone GET SSE stream for server-to-client
+      // notifications. This stateless server never pushes notifications, so the
+      // stream is useless — but we must answer GET gracefully:
+      //   - Letting the SDK transport handle GET opens a stream that never
+      //     closes → Workers cancels it as "hung" → client retries forever.
+      //   - Returning 405/404 makes the client treat SSE as broken and also
+      //     retry aggressively.
+      // Instead, return a valid but immediately-closed SSE stream. The client
+      // opens it once, sees a clean EOF, and does not hammer us with retries.
+      if (request.method === "GET") {
+        return new Response("", {
+          headers: {
+            "Content-Type": "text/event-stream",
+            "Cache-Control": "no-cache, no-transform",
+            ...CORS_HEADERS,
+          },
+        });
+      }
+
       if (request.method !== "POST") {
         return json(
           {
             jsonrpc: "2.0",
-            error: { code: -32000, message: "Method Not Allowed: stateless server only accepts POST" },
+            error: { code: -32000, message: "Method Not Allowed: stateless server only accepts GET or POST" },
             id: null,
           },
           405
